@@ -1,0 +1,489 @@
+# -*- coding: utf-8 -*-
+"""
+LSTM ile Aylık Doğal Gaz Tüketimi Tahmini
+-----------------------------------------
+
+Bu betik iki ana bölüme sahiptir:
+1) Modelin eğitilmesi ve kaydedilmesi
+2) Eğitilen modelle 2023-02 - 2023-12 dönemi için ileriye dönük tahmin yapılması
+"""
+
+import sys
+import os
+import random
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from matplotlib.ticker import FuncFormatter, MaxNLocator
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import Dense, Dropout, LSTM
+from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.regularizers import l2
+
+import joblib
+
+
+# ======================================================================
+# 0. TEKRARLANABİLİRLİK AYARLARI
+# ======================================================================
+
+os.environ["PYTHONHASHSEED"] = "42"
+os.environ["TF_DETERMINISTIC_OPS"] = "1"
+os.environ["TF_CUDNN_DETERMINISTIC"] = "1"
+os.environ["TF_CUDNN_USE_AUTOTUNE"] = "0"
+
+random.seed(42)
+np.random.seed(42)
+tf.random.set_seed(42)
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8")
+
+
+# ======================================================================
+# 1. VERİYİ OKUMA VE ÖN İŞLEME
+# ======================================================================
+
+# Not: GitHub sürümü için yol genel bırakıldı. Kendi yolunu burada güncelle:
+file_path = "dataset.xlsx"
+
+try:
+    data = pd.read_excel(file_path)
+    print("Veriler başarıyla yüklendi.")
+except FileNotFoundError:
+    print(f"Dosya bulunamadı: {file_path}")
+    sys.exit(1)
+except Exception as e:
+    print(f"Veri yükleme hatası: {e}")
+    sys.exit(1)
+
+# DONEM -> datetime
+data["DONEM"] = pd.to_datetime(data["DONEM"], format="%Y-%m")
+data.sort_values("DONEM", inplace=True)
+data.reset_index(drop=True, inplace=True)
+
+last_date = data["DONEM"].max()
+print(f"Veri setindeki son tarih: {last_date.strftime('%Y-%m')}")
+
+# Yıl / Ay kolonları
+data["Ay"] = data["DONEM"].dt.month
+data["Yıl"] = data["DONEM"].dt.year
+
+# Eksik değerleri doldurma (genel, örnek bir strateji)
+data["ABONE_SAYISI"].fillna(method="ffill", inplace=True)
+data["ORTALAMA_SICAKLIK"].fillna(data["ORTALAMA_SICAKLIK"].mean(), inplace=True)
+data["CDD"].fillna(0, inplace=True)
+data["HDD"].fillna(0, inplace=True)
+data["O_AY_BULUNAN_TATIL_GUNU_SAYISI"].fillna(0, inplace=True)
+data["GECEN_Ay_tuketımı"].fillna(method="ffill", inplace=True)
+
+# Aylık mevsimsellik için sin/cos dönüşümü
+data["Month_Sin"] = np.sin(2 * np.pi * data["Ay"] / 12)
+data["Month_Cos"] = np.cos(2 * np.pi * data["Ay"] / 12)
+
+# Mevsim & özel ay dummy’leri
+data["Is_Spring"] = data["Ay"].apply(lambda x: 1 if x in [3, 4, 5] else 0)
+data["Is_Summer"] = data["Ay"].apply(lambda x: 1 if x in [6, 7, 8] else 0)
+data["Is_Fall"] = data["Ay"].apply(lambda x: 1 if x in [9, 10, 11] else 0)
+data["Is_Winter"] = data["Ay"].apply(lambda x: 1 if x in [12, 1, 2] else 0)
+data["Is_Temmuz"] = data["Ay"].apply(lambda x: 1 if x == 7 else 0)
+
+# Gecikmeli tüketim özellikleri
+max_lag = 12
+for lag in range(1, max_lag + 1):
+    data[f"Toplam_Tuketım_Lag_{lag}"] = data["Toplam_Tuketım"].shift(lag)
+
+# Hareketli ortalama ve standart sapma
+data["MA_3"] = data["Toplam_Tuketım"].rolling(window=3).mean().shift(1)
+data["MA_6"] = data["Toplam_Tuketım"].rolling(window=6).mean().shift(1)
+data["MA_12"] = data["Toplam_Tuketım"].rolling(window=12).mean().shift(1)
+data["STD_3"] = data["Toplam_Tuketım"].rolling(window=3).std().shift(1)
+data["STD_6"] = data["Toplam_Tuketım"].rolling(window=6).std().shift(1)
+data["STD_12"] = data["Toplam_Tuketım"].rolling(window=12).std().shift(1)
+
+# Etkileşim terimleri
+data["Lag1_MA3"] = data["Toplam_Tuketım_Lag_1"] * data["MA_3"]
+data["Lag1_MA6"] = data["Toplam_Tuketım_Lag_1"] * data["MA_6"]
+data["GECEN_Ay_tuketımı_MA3"] = data["GECEN_Ay_tuketımı"] * data["MA_3"]
+
+# Eksik satırları at
+data.dropna(inplace=True)
+data.reset_index(drop=True, inplace=True)
+
+# Log dönüşümü (hedef)
+data["Toplam_Tuketım_Log"] = np.log1p(data["Toplam_Tuketım"])
+
+# Özellikler ve hedef
+feature_cols = [
+    col
+    for col in data.columns
+    if col not in ["DONEM", "Toplam_Tuketım", "Toplam_Tuketım_Log"]
+]
+X_raw = data[feature_cols].values
+y_raw = data["Toplam_Tuketım_Log"].values.reshape(-1, 1)
+
+# Ölçekleyiciler
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+
+X_scaled = scaler_X.fit_transform(X_raw)
+y_scaled = scaler_y.fit_transform(y_raw)
+
+# LSTM için şekil: (örnek, zaman_adımı, özellik_sayısı)
+X = X_scaled.reshape(X_scaled.shape[0], 1, X_scaled.shape[1])
+y = y_scaled
+
+# Son 12 tüketim (ileri tahmin için saklanıyor)
+last_lag_consumption = data["Toplam_Tuketım"].values[-max_lag:].tolist()
+
+
+# ======================================================================
+# 2. MODEL TANIMI VE EĞİTİM
+# ======================================================================
+
+def build_model(input_shape):
+    model = Sequential()
+    model.add(
+        LSTM(
+            units=256,
+            activation="tanh",
+            return_sequences=True,
+            input_shape=input_shape,
+            kernel_regularizer=l2(0.001),
+        )
+    )
+    model.add(
+        LSTM(
+            units=128,
+            activation="tanh",
+            return_sequences=True,
+            kernel_regularizer=l2(0.001),
+        )
+    )
+    model.add(
+        LSTM(
+            units=64,
+            activation="tanh",
+            return_sequences=False,
+            kernel_regularizer=l2(0.001),
+        )
+    )
+    model.add(Dropout(rate=0.3))
+    model.add(Dense(1))
+
+    optimizer = Adam(learning_rate=1e-4)
+    model.compile(optimizer=optimizer, loss="mse")
+    return model
+
+
+model = build_model(input_shape=(X.shape[1], X.shape[2]))
+model.summary()
+
+early_stopping = EarlyStopping(
+    monitor="val_loss", patience=30, restore_best_weights=True
+)
+reduce_lr = ReduceLROnPlateau(
+    monitor="val_loss", factor=0.5, patience=15, min_lr=1e-6
+)
+
+history = model.fit(
+    X,
+    y,
+    epochs=1000,
+    validation_split=0.1,
+    shuffle=False,  # zaman serisi
+    callbacks=[early_stopping, reduce_lr],
+    verbose=1,
+)
+
+# ======================================================================
+# 3. MODEL PERFORMANSI (TÜM VERİDE)
+# ======================================================================
+
+y_pred_scaled = model.predict(X)
+y_pred_log = scaler_y.inverse_transform(y_pred_scaled)
+y_pred = np.expm1(y_pred_log).flatten()
+
+y_true_log = scaler_y.inverse_transform(y)
+y_true = np.expm1(y_true_log).flatten()
+
+mse = mean_squared_error(y_true, y_pred)
+mae = mean_absolute_error(y_true, y_pred)
+r2 = r2_score(y_true, y_pred)
+mae_ratio = (mae / np.mean(y_true)) * 100
+
+print("\nModel Performans Metrikleri (Tüm Veri Kümesi):")
+print(f"MSE: {mse:.2f}")
+print(f"MAE: {mae:.2f}")
+print(f"MAE Oranı: {mae_ratio:.2f}%")
+print(f"R²: {r2:.4f}")
+
+
+def millions_formatter(x, pos):
+    return f"{x/1_000_000:.1f}M"
+
+
+results_df = pd.DataFrame(
+    {
+        "DONEM": data["DONEM"],
+        "Gerçek": y_true,
+        "Tahmin": y_pred,
+        "Kalanlar": y_true - y_pred,
+    }
+)
+
+plt.figure(figsize=(12, 6))
+plt.plot(results_df["DONEM"], results_df["Gerçek"], label="Gerçek", marker="o")
+plt.plot(
+    results_df["DONEM"],
+    results_df["Tahmin"],
+    label="Tahmin",
+    marker="x",
+    linestyle="--",
+)
+plt.xlabel("Tarih")
+plt.ylabel("Toplam Tüketim (m³)")
+plt.title("Gerçek vs Tahmin Toplam Tüketim")
+plt.gca().yaxis.set_major_formatter(FuncFormatter(millions_formatter))
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# ======================================================================
+# 4. MODEL VE ÖLÇEKLEYİCİLERİ KAYDETME
+# ======================================================================
+
+model.save("best_lstm_model.keras")
+joblib.dump(scaler_X, "scaler_X.pkl")
+joblib.dump(scaler_y, "scaler_y.pkl")
+joblib.dump(feature_cols, "feature_cols.pkl")
+joblib.dump(last_lag_consumption, "last_12_consumption.pkl")
+
+print("\nModel ve yardımcı dosyalar kaydedildi:")
+print(" - best_lstm_model.keras")
+print(" - scaler_X.pkl, scaler_y.pkl")
+print(" - feature_cols.pkl")
+print(" - last_12_consumption.pkl")
+
+
+# ======================================================================
+# 5. EĞİTİLMİŞ MODELLE 2023-02 – 2023-12 TAHMİNİ
+# ======================================================================
+
+# Model ve araçları yeniden yükleyerek "bağımsız bir tahmin betiği" gibi çalışabilir
+loaded_model = load_model("best_lstm_model.keras")
+scaler_X_loaded = joblib.load("scaler_X.pkl")
+scaler_y_loaded = joblib.load("scaler_y.pkl")
+feature_cols_loaded = joblib.load("feature_cols.pkl")
+last_lag_consumption_loaded = joblib.load("last_12_consumption.pkl")
+
+try:
+    historical_data = pd.read_excel(file_path)
+    print("\nGeçmiş veriler tekrar yüklendi.")
+except Exception as e:
+    print(f"Veri yükleme hatası: {e}")
+    sys.exit(1)
+
+historical_data["DONEM"] = pd.to_datetime(
+    historical_data["DONEM"], format="%Y-%m"
+)
+historical_data.sort_values("DONEM", inplace=True)
+historical_data.reset_index(drop=True, inplace=True)
+
+# Yeni dönemler (örnek: 2023-02 - 2023-12)
+new_donem = pd.date_range(start="2023-02", end="2023-12", freq="MS")
+new_data = pd.DataFrame({"DONEM": new_donem})
+
+max_lag_pred = 12
+predictions = []
+
+# Orijinal listeyi bozmamak için kopya
+lag_consumption = last_lag_consumption_loaded.copy()
+
+# Basit varsayımlar (örnek amaçlı)
+abone_sayisi = historical_data["ABONE_SAYISI"].values[-1]
+ortalama_sicaklik = historical_data["ORTALAMA_SICAKLIK"].values[-12:].tolist()
+cdd = historical_data["CDD"].values[-12:].tolist()
+hdd = historical_data["HDD"].values[-12:].tolist()
+tatil_gun_sayisi = (
+    historical_data["O_AY_BULUNAN_TATIL_GUNU_SAYISI"].values[-12:].tolist()
+)
+gecen_ay_tuketimi = historical_data["GECEN_Ay_tuketımı"].values[-1]
+
+for donem_dt in new_donem:
+    current_features = {}
+    current_features["Yıl"] = donem_dt.year
+    current_features["Ay"] = donem_dt.month
+    current_features["ABONE_SAYISI"] = abone_sayisi
+
+    current_features["Month_Sin"] = np.sin(2 * np.pi * donem_dt.month / 12)
+    current_features["Month_Cos"] = np.cos(2 * np.pi * donem_dt.month / 12)
+
+    current_features["Is_Spring"] = 1 if donem_dt.month in [3, 4, 5] else 0
+    current_features["Is_Summer"] = 1 if donem_dt.month in [6, 7, 8] else 0
+    current_features["Is_Fall"] = 1 if donem_dt.month in [9, 10, 11] else 0
+    current_features["Is_Winter"] = 1 if donem_dt.month in [12, 1, 2] else 0
+    current_features["Is_Temmuz"] = 1 if donem_dt.month == 7 else 0
+
+    # Lag özellikleri
+    for lag in range(1, max_lag_pred + 1):
+        if lag <= len(lag_consumption):
+            current_features[f"Toplam_Tuketım_Lag_{lag}"] = lag_consumption[
+                -lag
+            ]
+        else:
+            current_features[f"Toplam_Tuketım_Lag_{lag}"] = 0
+
+    # Hareketli istatistikler
+    if len(lag_consumption) >= 3:
+        current_features["MA_3"] = np.mean(lag_consumption[-3:])
+        current_features["STD_3"] = np.std(lag_consumption[-3:])
+    else:
+        current_features["MA_3"] = 0
+        current_features["STD_3"] = 0
+
+    if len(lag_consumption) >= 6:
+        current_features["MA_6"] = np.mean(lag_consumption[-6:])
+        current_features["STD_6"] = np.std(lag_consumption[-6:])
+    else:
+        current_features["MA_6"] = 0
+        current_features["STD_6"] = 0
+
+    if len(lag_consumption) >= 12:
+        current_features["MA_12"] = np.mean(lag_consumption[-12:])
+        current_features["STD_12"] = np.std(lag_consumption[-12:])
+    else:
+        current_features["MA_12"] = 0
+        current_features["STD_12"] = 0
+
+    current_features["Lag1_MA3"] = (
+        current_features.get("Toplam_Tuketım_Lag_1", 0)
+        * current_features.get("MA_3", 0)
+    )
+    current_features["Lag1_MA6"] = (
+        current_features.get("Toplam_Tuketım_Lag_1", 0)
+        * current_features.get("MA_6", 0)
+    )
+
+    current_features["GECEN_Ay_tuketımı"] = gecen_ay_tuketimi
+    current_features["GECEN_Ay_tuketımı_MA3"] = (
+        gecen_ay_tuketimi * current_features.get("MA_3", 0)
+    )
+
+    # Burada sıcaklık / HDD / CDD / tatil serileri için basit ortalama kullanılıyor.
+    # Gerçek uygulamada her ay için ayrı değerler beslenebilir.
+    current_features["ORTALAMA_SICAKLIK"] = np.mean(ortalama_sicaklik)
+    current_features["CDD"] = np.mean(cdd)
+    current_features["HDD"] = np.mean(hdd)
+    current_features["O_AY_BULUNAN_TATIL_GUNU_SAYISI"] = np.mean(
+        tatil_gun_sayisi
+    )
+
+    current_df = pd.DataFrame([current_features])
+    current_df = current_df.reindex(columns=feature_cols_loaded, fill_value=0)
+
+    current_scaled = scaler_X_loaded.transform(current_df.values)
+    X_new = current_scaled.reshape(1, 1, len(feature_cols_loaded))
+
+    y_new_scaled = loaded_model.predict(X_new)
+    y_new_log = scaler_y_loaded.inverse_transform(y_new_scaled)
+    y_new = np.expm1(y_new_log).flatten()[0]
+
+    predictions.append(y_new)
+
+    lag_consumption.append(y_new)
+    if len(lag_consumption) > max_lag_pred:
+        lag_consumption.pop(0)
+
+    gecen_ay_tuketimi = y_new
+
+new_data["Tahmin_Tuketim"] = predictions
+
+# ======================================================================
+# 6. GERÇEK VERİLERLE (TEMSiLİ) KARŞILAŞTIRMA
+# ======================================================================
+
+# DİKKAT:
+# Aşağıdaki liste GitHub sürümü için TEMSiLİ / SENTETiK değerlerdir.
+# Kurumsal gerçek veriler buraya doğrudan yazılmamalıdır.
+example_gercek_degerler = [
+    2.4e7,
+    1.8e7,
+    1.7e7,
+    1.6e7,
+    9.5e6,
+    1.1e7,
+    1.8e7,
+    1.2e7,
+    1.5e7,
+    1.8e7,
+    3.5e7,
+]  # 11 adet örnek değer (2023-02..2023-12)
+
+if len(example_gercek_degerler) != len(new_data):
+    raise ValueError("example_gercek_degerler uzunluğu new_data ile uyumlu olmalı.")
+
+new_data["Gercek_Tuketim"] = example_gercek_degerler
+
+# Eski dönem + tahminleri birleştir
+combined_data = pd.merge(
+    historical_data[["DONEM", "Toplam_Tuketım"]],
+    new_data[["DONEM", "Tahmin_Tuketim"]],
+    on="DONEM",
+    how="outer",
+)
+
+combined_data["Toplam_Tuketım"] = combined_data["Toplam_Tuketım"].fillna(
+    combined_data["Tahmin_Tuketim"]
+)
+combined_data.drop(columns=["Tahmin_Tuketim"], inplace=True)
+combined_data.sort_values("DONEM", inplace=True)
+combined_data.reset_index(drop=True, inplace=True)
+
+# ======================================================================
+# 7. 2023-02 – 2023-12 DÖNEMİ GRAFİĞİ (GERÇEK vs TAHMİN)
+# ======================================================================
+
+plt.figure(figsize=(14, 6))
+
+plt.plot(
+    new_data["DONEM"],
+    new_data["Gercek_Tuketim"],
+    label="Gerçek Tüketim (Temsili)",
+    marker="o",
+)
+plt.plot(
+    new_data["DONEM"],
+    new_data["Tahmin_Tuketim"],
+    label="Tahmin Edilen Tüketim",
+    marker="x",
+    linestyle="--",
+)
+
+plt.title("Gerçek (Temsili) ve Tahmin Edilen Toplam Tüketim (2023-02 - 2023-12)")
+plt.xlabel("Dönem")
+plt.ylabel("Toplam Tüketim (m³)")
+
+plt.gca().yaxis.set_major_formatter(FuncFormatter(millions_formatter))
+
+max_consumption = max(
+    new_data["Gercek_Tuketim"].max(), new_data["Tahmin_Tuketim"].max()
+)
+plt.gca().set_ylim(0, max_consumption * 1.1)
+plt.gca().yaxis.set_major_locator(MaxNLocator(nbins=10))
+
+plt.grid(True, linestyle="--", alpha=0.5)
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
