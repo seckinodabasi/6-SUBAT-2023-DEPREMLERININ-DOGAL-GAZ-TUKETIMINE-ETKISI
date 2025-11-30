@@ -49,10 +49,8 @@ if hasattr(sys.stdout, "reconfigure"):
 
 
 # ======================================================================
-# 1. VERİYİ OKUMA VE ÖN İŞLEME
+# 1. VERİYİ OKUMA & ÖN İŞLEME
 # ======================================================================
-
-# Not: GitHub sürümü için yol genel bırakıldı. Kendi yolunu burada güncelle:
 file_path = "dataset.xlsx"
 
 try:
@@ -77,7 +75,7 @@ print(f"Veri setindeki son tarih: {last_date.strftime('%Y-%m')}")
 data["Ay"] = data["DONEM"].dt.month
 data["Yıl"] = data["DONEM"].dt.year
 
-# Eksik değerleri doldurma (genel, örnek bir strateji)
+# Eksik değerleri doldurma (genel)
 data["ABONE_SAYISI"].fillna(method="ffill", inplace=True)
 data["ORTALAMA_SICAKLIK"].fillna(data["ORTALAMA_SICAKLIK"].mean(), inplace=True)
 data["CDD"].fillna(0, inplace=True)
@@ -141,7 +139,7 @@ y_scaled = scaler_y.fit_transform(y_raw)
 X = X_scaled.reshape(X_scaled.shape[0], 1, X_scaled.shape[1])
 y = y_scaled
 
-# Son 12 tüketim (ileri tahmin için saklanıyor)
+# Son 12 tüketim 
 last_lag_consumption = data["Toplam_Tuketım"].values[-max_lag:].tolist()
 
 
@@ -300,7 +298,7 @@ historical_data["DONEM"] = pd.to_datetime(
 historical_data.sort_values("DONEM", inplace=True)
 historical_data.reset_index(drop=True, inplace=True)
 
-# Yeni dönemler (örnek: 2023-02 - 2023-12)
+# Yeni dönemler 
 new_donem = pd.date_range(start="2023-02", end="2023-12", freq="MS")
 new_data = pd.DataFrame({"DONEM": new_donem})
 
@@ -310,7 +308,7 @@ predictions = []
 # Orijinal listeyi bozmamak için kopya
 lag_consumption = last_lag_consumption_loaded.copy()
 
-# Basit varsayımlar (örnek amaçlı)
+# Basit varsayımlar 
 abone_sayisi = historical_data["ABONE_SAYISI"].values[-1]
 ortalama_sicaklik = historical_data["ORTALAMA_SICAKLIK"].values[-12:].tolist()
 cdd = historical_data["CDD"].values[-12:].tolist()
@@ -415,7 +413,7 @@ new_data["Tahmin_Tuketim"] = predictions
 
 # DİKKAT:
 # Aşağıdaki liste GitHub sürümü için TEMSiLİ / SENTETiK değerlerdir.
-# Kurumsal gerçek veriler buraya doğrudan yazılmamalıdır.
+# Kurumsal gerçek veriler buraya doğrudan yazmamaktadır.
 example_gercek_degerler = [
     2.4e7,
     1.8e7,
